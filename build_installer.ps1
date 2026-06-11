@@ -6,15 +6,22 @@ param(
 $root = Split-Path -Path $MyInvocation.MyCommand.Path -Parent
 Set-Location $root
 
+$pythonCmd = "python"
+$pythonArgs = @()
+if (-not (Get-Command python -ErrorAction SilentlyContinue) -and (Get-Command py -ErrorAction SilentlyContinue)) {
+    $pythonCmd = "py"
+    $pythonArgs = @("-3")
+}
+
 if ($InstallDependencies) {
-    python -m pip install --upgrade pip
-    python -m pip install -r requirements.txt
-    python -m pip install -r requirements-dev.txt
+    & $pythonCmd @pythonArgs -m pip install --upgrade pip
+    & $pythonCmd @pythonArgs -m pip install -r requirements.txt
+    & $pythonCmd @pythonArgs -m pip install -r requirements-dev.txt
 }
 
 if (-not (Test-Path "$root\\icon.ico")) {
     Write-Host "Generating icon file..."
-    py -3 make_icon.py
+    & $pythonCmd @pythonArgs make_icon.py
 }
 
 $pyiArgs = @(
@@ -30,7 +37,7 @@ if (Test-Path "$root\\icon.ico") {
 $pyiArgs += "sqli_toolkit_qt.py"
 
 Write-Host "Building SQLi Toolkit executable with args: $pyiArgs"
-& python -m PyInstaller @pyiArgs
+& $pythonCmd @pythonArgs -m PyInstaller @pyiArgs
 
 # Modify .spec file to include icon.ico in datas
 if (Test-Path "$root\\SQLiToolkit.spec") {
